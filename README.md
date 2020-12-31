@@ -17,7 +17,7 @@ $ xcaddy build \
                         {
                             "handle": [
                                 {
-                                    "handler": "trojan",
+                                    "handler": "shadowsocks_tls",
                                     "server": "127.0.0.1:8388",
                                     "users": ["password-1", "password-2"]
                                 }
