@@ -78,8 +78,8 @@ func (m *Handler) Provision(ctx caddy.Context) (err error) {
 		m.last = time.Now()
 	}
 
-	if _, err = net.ResolveIPAddr("ip", m.Server); err != nil {
-		return err
+	if m.Server == "" {
+		return errors.New("no shadowsocks server")
 	}
 	for _, user := range m.Users {
 		m.logger.Info(fmt.Sprintf("add new user: %v", user))
