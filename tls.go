@@ -57,23 +57,30 @@ func (m *Handler) Provision(ctx caddy.Context) (err error) {
 		m.logger.Info(fmt.Sprintf("add shadowbox server: %v", m.ShadowBox))
 	}
 
-	server, err := outline.NewOutlineServer(m.ShadowBox)
-	if err != nil {
-		return
-	}
-	if m.Server == "" {
-		m.Server = "127.0.0.1:" + strconv.Itoa(server.PortForNewAccessKeys)
+	if m.ShadowBox != "" {
+		server, er := outline.NewOutlineServer(m.ShadowBox)
+		if er != nil {
+			err = er
+			return
+		}
+
+		if m.Server == "" {
+			m.Server = "127.0.0.1:" + strconv.Itoa(server.PortForNewAccessKeys)
+		}
+
+		m.logger.Info("add user from shadowbox server")
+		for _, user := range server.Users {
+			m.logger.Info(fmt.Sprintf("add new user: %v", user.Password))
+			sum := sha256.Sum224([]byte(user.Password))
+			auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
+			m.users[auth] = struct{}{}
+		}
+		m.last = time.Now()
 	}
 
-	m.logger.Info("add user from shadowbox server")
-	for _, user := range server.Users {
-		m.logger.Info(fmt.Sprintf("add new user: %v", user.Password))
-		sum := sha256.Sum224([]byte(user.Password))
-		auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
-		m.users[auth] = struct{}{}
+	if _, err = net.ResolveIPAddr("ip", m.Server); err != nil {
+		return err
 	}
-	m.last = time.Now()
-
 	for _, user := range m.Users {
 		m.logger.Info(fmt.Sprintf("add new user: %v", user))
 		sum := sha256.Sum224([]byte(user))
