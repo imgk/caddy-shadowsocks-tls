@@ -238,8 +238,8 @@ func (c *Conn) CloseRead() error {
 	if closer, ok := c.Conn.(CloseReader); ok {
 		return closer.CloseRead()
 	}
-	time.AfterFunc(time.Minute, func() { c.Conn.Close() })
-	return nil
+	c.Conn.SetReadDeadline(time.Now())
+	return c.Conn.Close()
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
@@ -256,8 +256,8 @@ func (c *Conn) CloseWrite() error {
 	if closer, ok := c.Conn.(CloseWriter); ok {
 		return closer.CloseWrite()
 	}
-	time.AfterFunc(time.Minute, func() { c.Conn.Close() })
-	return nil
+	c.Conn.SetWriteDeadline(time.Now())
+	return c.Conn.Close()
 }
 
 func HandleTCP(conn *Conn, addr string) error {
