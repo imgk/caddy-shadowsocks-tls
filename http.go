@@ -32,7 +32,7 @@ type Handler struct {
 	Users     []string `json:"users,omitempty"`
 
 	logger *zap.Logger
-	mu     sync.RWMutex
+	mutex  *sync.RWMutex
 	users  map[string]struct{}
 	last   time.Time
 }
@@ -48,12 +48,13 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision implements caddy.Provisioner.
 func (m *Handler) Provision(ctx caddy.Context) (err error) {
 	m.logger = ctx.Logger(m)
+	m.mutex = new(sync.RWMutex)
 	m.users = make(map[string]struct{})
 
 	prefix := os.Getenv("SB_API_PREFIX")
 	port := os.Getenv("SB_API_PORT")
 	if prefix != "" && port != "" && m.ShadowBox == "" {
-		m.ShadowBox = "https://127.0.0.1:" + port + "/" + prefix
+		m.ShadowBox = fmt.Sprintf("https://127.0.0.1:%s/%s", port, prefix)
 		m.logger.Info(fmt.Sprintf("add shadowbox server: %v", m.ShadowBox))
 	}
 
@@ -91,7 +92,7 @@ func (m *Handler) Provision(ctx caddy.Context) (err error) {
 }
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
-func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (err error) {
+func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if r.Method != http.MethodConnect {
 		return next.ServeHTTP(w, r)
 	}
@@ -99,44 +100,49 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return next.ServeHTTP(w, r)
 	}
 
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		err = errors.New("http hijacker error")
-		return
-	}
-	conn, rw, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if n := rw.Reader.Buffered(); n > 0 {
-		b := make([]byte, n)
-		if _, err := io.ReadFull(rw, b); err != nil {
-			panic("io.ReadFull error")
+	var rwc io.ReadWriteCloser
+	switch r.ProtoMajor {
+	case 1:
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			return errors.New("http hijacker error")
 		}
-		conn = &Conn{Conn: conn, Reader: bytes.NewReader(b)}
-	} else {
-		conn = &Conn{Conn: conn}
+		conn, rw, er := hijacker.Hijack()
+		if er != nil {
+			http.Error(w, er.Error(), http.StatusInternalServerError)
+			return er
+		}
+		if n := rw.Reader.Buffered(); n > 0 {
+			b := make([]byte, n)
+			if _, err := io.ReadFull(rw, b); err != nil {
+				panic("io.ReadFull error")
+			}
+			rwc = &Conn{Closer: conn, rw: conn, Reader: bytes.NewReader(b)}
+		} else {
+			rwc = &Conn{Closer: conn, rw: conn}
+		}
+	case 2, 3:
+		rwc = rwConn{Reader: r.Body, Writer: w, Closer: r.Body}
 	}
 
-	switch r.Host {
-	case "tcp.imgk.cc":
-		m.logger.Info(fmt.Sprintf("handle tcp connection from %v", conn.RemoteAddr()))
-		err = HandleTCP(conn.(*Conn), m.Server)
-		if err != nil {
-			err = fmt.Errorf("handle tcp error: %v", err)
+	switch r.Host[:4] {
+	case "tcp.":
+		m.logger.Info(fmt.Sprintf("handle tcp connection from %v", r.RemoteAddr))
+		if err := HandleTCP(rwc, m.Server); err != nil {
+			m.logger.Error(fmt.Sprintf("handle tcp error: %v", err))
 		}
-	case "udp.imgk.cc":
-		m.logger.Info(fmt.Sprintf("handle udp connection from %v", conn.RemoteAddr()))
-		err = HandleUDP(conn.(*Conn), m.Server)
-		if err != nil {
-			err = fmt.Errorf("handle udp error: %v", err)
+	case "udp.":
+		m.logger.Info(fmt.Sprintf("handle udp connection from %v", r.RemoteAddr))
+		if err := HandleUDP(rwc, m.Server, time.Minute*3); err != nil {
+			m.logger.Error(fmt.Sprintf("handle udp error: %v", err))
 		}
 	default:
-		err = errors.New("common http CONNECT is not supported")
+		if _, ok := w.(http.Hijacker); !ok {
+			return next.ServeHTTP(w, r)
+		}
 	}
 
-	return
+	return nil
 }
 
 // Interface guards
@@ -145,13 +151,14 @@ var (
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 )
 
+// AuthLen is the length is http basic auth
 var AuthLen = len(fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(make([]byte, 28))))))
 
 func (m *Handler) authenticate(r *http.Request) bool {
 	auth := r.Header.Get("Proxy-Authorization")
-	m.mu.RLock()
+	m.mutex.RLock()
 	_, ok := m.users[auth]
-	m.mu.RUnlock()
+	m.mutex.RUnlock()
 
 	if ok {
 		return true
@@ -160,13 +167,13 @@ func (m *Handler) authenticate(r *http.Request) bool {
 		return false
 	}
 
-	m.mu.Lock()
+	m.mutex.Lock()
 	if _, ok = m.users[auth]; ok {
-		m.mu.Unlock()
+		m.mutex.Unlock()
 		return true
 	}
 	if time.Now().Sub(m.last) < time.Second {
-		m.mu.Unlock()
+		m.mutex.Unlock()
 		return false
 	}
 
@@ -176,55 +183,48 @@ func (m *Handler) authenticate(r *http.Request) bool {
 		return false
 	}
 
-	for k, _ := range m.users {
-		delete(m.users, k)
+	for user := range m.users {
+		delete(m.users, user)
 	}
 	for _, user := range server.Users {
-		m.logger.Info(fmt.Sprintf("add new user: ", user.Password))
+		m.logger.Info(fmt.Sprintf("add new user: %v", user.Password))
 		sum := sha256.Sum224([]byte(user.Password))
 		auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
 		m.users[auth] = struct{}{}
 	}
 	for _, user := range m.Users {
-		m.logger.Info(fmt.Sprintf("add new user: ", user))
+		m.logger.Info(fmt.Sprintf("add new user: %v", user))
 		sum := sha256.Sum224([]byte(user))
 		auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
 		m.users[auth] = struct{}{}
 	}
 	m.last = time.Now()
-	m.mu.Unlock()
+	m.mutex.Unlock()
 
-	m.mu.RLock()
+	m.mutex.RLock()
 	_, ok = m.users[auth]
-	m.mu.RUnlock()
+	m.mutex.RUnlock()
 	return ok
 }
 
-var response = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
-
-type CloseReader interface {
-	CloseRead() error
+type rwConn struct {
+	io.Reader
+	io.Writer
+	io.Closer
 }
 
-type CloseWriter interface {
-	CloseWrite() error
-}
-
-type DuplexConn interface {
-	net.Conn
-	CloseReader
-	CloseWriter
-}
-
+// Conn is ...
 type Conn struct {
-	net.Conn
+	io.Closer
+	rw     io.ReadWriter
 	Reader io.Reader
 	Writer io.Writer
 }
 
+// Read is ...
 func (c *Conn) Read(b []byte) (int, error) {
 	if c.Reader == nil {
-		return c.Conn.Read(b)
+		return c.rw.Read(b)
 	}
 	n, err := c.Reader.Read(b)
 	if errors.Is(err, io.EOF) {
@@ -234,34 +234,20 @@ func (c *Conn) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func (c *Conn) CloseRead() error {
-	if closer, ok := c.Conn.(CloseReader); ok {
-		return closer.CloseRead()
-	}
-	c.Conn.SetReadDeadline(time.Now())
-	return c.Conn.Close()
-}
-
+// Write ...
 func (c *Conn) Write(b []byte) (int, error) {
 	if c.Writer == nil {
-		if _, err := c.Conn.Write(response); err != nil {
+		if _, err := io.WriteString(c.rw, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 			return 0, err
 		}
-		c.Writer = c.Conn
+		c.Writer = c.rw
 	}
 	return c.Writer.Write(b)
 }
 
-func (c *Conn) CloseWrite() error {
-	if closer, ok := c.Conn.(CloseWriter); ok {
-		return closer.CloseWrite()
-	}
-	c.Conn.SetWriteDeadline(time.Now())
-	return c.Conn.Close()
-}
-
-func HandleTCP(conn *Conn, addr string) error {
-	defer conn.Close()
+// HandleTCP is ...
+func HandleTCP(rwc io.ReadWriteCloser, addr string) error {
+	defer rwc.Close()
 
 	raddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -276,33 +262,36 @@ func HandleTCP(conn *Conn, addr string) error {
 
 	errCh := make(chan error, 1)
 	go func(chan error) {
-		_, err := io.Copy(rc, conn)
+		_, err := io.Copy(io.Writer(rc), rwc)
 		if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 			rc.CloseWrite()
-			conn.CloseRead()
+			rwc.Close()
 			errCh <- nil
 			return
 		}
 		rc.SetReadDeadline(time.Now())
-		conn.SetWriteDeadline(time.Now())
+		rc.CloseRead()
+		rwc.Close()
 		errCh <- err
 	}(errCh)
 
-	_, err = io.Copy(conn, rc)
+	_, err = io.Copy(rwc, io.Reader(rc))
 	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		conn.CloseWrite()
 		rc.CloseRead()
+		rwc.Close()
 		return <-errCh
 	}
-	conn.SetReadDeadline(time.Now())
 	rc.SetWriteDeadline(time.Now())
+	rc.CloseWrite()
+	rwc.Close()
 	<-errCh
 
 	return err
 }
 
-func HandleUDP(conn *Conn, addr string) error {
-	defer conn.Close()
+// HandleUDP is ...
+func HandleUDP(rwc io.ReadWriteCloser, addr string, timeout time.Duration) error {
+	defer rwc.Close()
 
 	raddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -319,19 +308,21 @@ func HandleUDP(conn *Conn, addr string) error {
 	go func(chan error) (err error) {
 		defer func() {
 			if err == nil || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) {
+				rwc.Close()
 				errCh <- nil
 				return
 			}
+			rwc.Close()
 			errCh <- err
 		}()
 
 		b := make([]byte, 16*1024)
 		for {
-			if _, err = io.ReadFull(conn, b[:2]); err != nil {
+			if _, err = io.ReadFull(rwc, b[:2]); err != nil {
 				break
 			}
 			n := int(b[0])<<8 | int(b[1])
-			if _, err = io.ReadFull(conn, b[:n]); err != nil {
+			if _, err = io.ReadFull(rwc, b[:n]); err != nil {
 				break
 			}
 			if _, err = rc.Write(b[:n]); err != nil {
@@ -345,22 +336,24 @@ func HandleUDP(conn *Conn, addr string) error {
 	b := make([]byte, 16*1024)
 	for {
 		n := 0
-		rc.SetReadDeadline(time.Now().Add(time.Minute))
+		rc.SetReadDeadline(time.Now().Add(timeout))
 		n, err = rc.Read(b[2:])
 		if err != nil {
 			break
 		}
 		b[0] = byte(n >> 8)
 		b[1] = byte(n)
-		if _, err = conn.Write(b[:2+n]); err != nil {
+		if _, err = rwc.Write(b[:2+n]); err != nil {
 			break
 		}
 	}
-	conn.SetReadDeadline(time.Now())
+	rc.SetWriteDeadline(time.Now())
 
 	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) {
+		rwc.Close()
 		return <-errCh
 	}
+	rwc.Close()
 	<-errCh
 
 	return err
