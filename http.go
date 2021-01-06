@@ -122,7 +122,7 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			rwc = &Conn{Closer: conn, rw: conn}
 		}
 	case 2, 3:
-		rwc = rwConn{Reader: r.Body, Writer: w, Closer: r.Body}
+		rwc = &rwConn{Reader: r.Body, Writer: w, Closer: r.Body}
 	}
 
 	switch r.Host[:4] {
@@ -211,6 +211,14 @@ type rwConn struct {
 	io.Reader
 	io.Writer
 	io.Closer
+}
+
+func (c *rwConn) Write(b []byte) (n int, err error) {
+	n, err = c.Writer.Write(b)
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return
 }
 
 // Conn is ...
