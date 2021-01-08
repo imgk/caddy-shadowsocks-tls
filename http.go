@@ -3,6 +3,7 @@ package shadowsocks
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -224,9 +225,20 @@ func (c *rwConn) Write(b []byte) (n int, err error) {
 
 // Conn is ...
 type Conn struct {
-	rw     io.ReadWriter
+	rw     net.Conn
 	Reader io.Reader
 	Writer io.Writer
+}
+
+// CloseWrite: *net.TCPConn and *tls.Conn
+func (c *Conn) CloseWrite() error {
+	if conn, ok := c.rw.(*net.TCPConn); ok {
+		return conn.CloseWrite()
+	}
+	if conn, ok := c.rw.(*tls.Conn); ok {
+		return conn.CloseWrite()
+	}
+	return errors.New("conn type error")
 }
 
 // Read is ...
@@ -281,6 +293,9 @@ func HandleTCP(rw io.ReadWriter, addr string) error {
 
 	_, err = io.Copy(rw, io.Reader(rc))
 	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		if conn, ok := rw.(*Conn); ok {
+			conn.CloseWrite()
+		}
 		rc.CloseRead()
 		return <-errCh
 	}
