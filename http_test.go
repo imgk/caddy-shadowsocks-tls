@@ -14,3 +14,11 @@ func TestStringToByteSlice(t *testing.T) {
 		t.Errorf("error for: %s", s)
 	}
 }
+
+func TestGenKey(t *testing.T) {
+	if len(GenKey("Test1234")) == AuthLen {
+		return
+	}
+	t.Errorf("auth length")
+}
+
