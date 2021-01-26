@@ -12,14 +12,19 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
+	"reflect"
 	"sync"
 	"time"
+	"unsafe"
+
+	"golang.org/x/time/rate"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/imgk/caddy-shadowsocks-tls/outline"
+
 	"go.uber.org/zap"
+
+	"github.com/imgk/caddy-shadowsocks-tls/outline"
 )
 
 func init() {
@@ -33,9 +38,12 @@ type Handler struct {
 	Users     []string `json:"users,omitempty"`
 
 	logger *zap.Logger
+	limit  *rate.Limiter
 	mutex  *sync.RWMutex
 	users  map[string]struct{}
-	last   time.Time
+
+	proxyIP   net.IP
+	proxyPort int
 }
 
 // CaddyModule returns the Caddy module information.
@@ -67,27 +75,27 @@ func (m *Handler) Provision(ctx caddy.Context) (err error) {
 		}
 
 		if m.Server == "" {
-			m.Server = "127.0.0.1:" + strconv.Itoa(server.PortForNewAccessKeys)
+			m.Server = fmt.Sprintf("127.0.0.1:%v", server.PortForNewAccessKeys)
 		}
 
 		m.logger.Info("add user from shadowbox server")
 		for _, user := range server.Users {
 			m.logger.Info(fmt.Sprintf("add new user: %v", user.Password))
-			sum := sha256.Sum224([]byte(user.Password))
-			auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
-			m.users[auth] = struct{}{}
+			m.users[GenKey(user.Password)] = struct{}{}
 		}
-		m.last = time.Now()
+		m.limit = rate.NewLimiter(rate.Every(time.Second), 1)
 	}
 
-	if m.Server == "" {
-		return errors.New("no shadowsocks server")
+	proxyAddr, err := net.ResolveTCPAddr("tcp", m.Server)
+	if err != nil {
+		return
 	}
+	m.proxyIP = proxyAddr.IP
+	m.proxyPort = proxyAddr.Port
+
 	for _, user := range m.Users {
 		m.logger.Info(fmt.Sprintf("add new user: %v", user))
-		sum := sha256.Sum224([]byte(user))
-		auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
-		m.users[auth] = struct{}{}
+		m.users[GenKey(user)] = struct{}{}
 	}
 	return
 }
@@ -101,7 +109,7 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return next.ServeHTTP(w, r)
 	}
 
-	var rw io.ReadWriter
+	rw := io.ReadWriter(nil)
 	switch r.ProtoMajor {
 	case 1:
 		hijacker, ok := w.(http.Hijacker)
@@ -121,9 +129,9 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			if _, err := io.ReadFull(buf.Reader, b); err != nil {
 				panic("io.ReadFull error")
 			}
-			rw = &Conn{rw: conn, Reader: bytes.NewReader(b)}
+			rw = &rawConn{rw: conn, Reader: bytes.NewReader(b)}
 		} else {
-			rw = &Conn{rw: conn}
+			rw = &rawConn{rw: conn}
 		}
 	case 2, 3:
 		rw = &rwConn{Reader: r.Body, Writer: w, Flusher: w.(http.Flusher)}
@@ -132,12 +140,12 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	switch r.Host[:4] {
 	case "tcp.":
 		m.logger.Info(fmt.Sprintf("handle tcp connection from %v", r.RemoteAddr))
-		if err := HandleTCP(rw, m.Server); err != nil {
+		if err := HandleTCP(rw, &net.TCPAddr{IP: m.proxyIP, Port: m.proxyPort}); err != nil {
 			m.logger.Error(fmt.Sprintf("handle tcp error: %v", err))
 		}
 	case "udp.":
 		m.logger.Info(fmt.Sprintf("handle udp connection from %v", r.RemoteAddr))
-		if err := HandleUDP(rw, m.Server, time.Minute*3); err != nil {
+		if err := HandleUDP(rw, &net.UDPAddr{IP: m.proxyIP, Port: m.proxyPort}, time.Minute*3); err != nil {
 			m.logger.Error(fmt.Sprintf("handle udp error: %v", err))
 		}
 	default:
@@ -155,8 +163,26 @@ var (
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 )
 
+func StringToByteSlice(s string) []byte {
+	ptr := (*reflect.StringHeader)(unsafe.Pointer(&s))
+	hdr := &reflect.SliceHeader{
+		Data: ptr.Data,
+		Cap:  ptr.Len,
+		Len:  ptr.Len,
+	}
+	return *(*[]byte)(unsafe.Pointer(hdr))
+}
+
+func GenKey(s string) string {
+	sum := sha256.Sum224(StringToByteSlice(s))
+	hex := StringToByteSlice(hex.EncodeToString(sum[:]))
+	b64 := base64.StdEncoding.EncodeToString(hex)
+	return fmt.Sprintf("Basic %v", b64)
+}
+
 // AuthLen is the length is http basic auth
-var AuthLen = len(fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(make([]byte, 28))))))
+// len(GenKey("Test1234"))
+const AuthLen = 82
 
 func (m *Handler) authenticate(r *http.Request) bool {
 	auth := r.Header.Get("Proxy-Authorization")
@@ -176,7 +202,7 @@ func (m *Handler) authenticate(r *http.Request) bool {
 		m.mutex.Unlock()
 		return true
 	}
-	if time.Now().Sub(m.last) < time.Second {
+	if !m.limit.Allow() {
 		m.mutex.Unlock()
 		return false
 	}
@@ -192,17 +218,12 @@ func (m *Handler) authenticate(r *http.Request) bool {
 	}
 	for _, user := range server.Users {
 		m.logger.Info(fmt.Sprintf("add new user: %v", user.Password))
-		sum := sha256.Sum224([]byte(user.Password))
-		auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
-		m.users[auth] = struct{}{}
+		m.users[GenKey(user.Password)] = struct{}{}
 	}
 	for _, user := range m.Users {
 		m.logger.Info(fmt.Sprintf("add new user: %v", user))
-		sum := sha256.Sum224([]byte(user))
-		auth := fmt.Sprintf("Basic %v", base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(sum[:]))))
-		m.users[auth] = struct{}{}
+		m.users[GenKey(user)] = struct{}{}
 	}
-	m.last = time.Now()
 	m.mutex.Unlock()
 
 	m.mutex.RLock()
@@ -223,15 +244,15 @@ func (c *rwConn) Write(b []byte) (n int, err error) {
 	return
 }
 
-// Conn is ...
-type Conn struct {
+// rawConn is ...
+type rawConn struct {
 	rw     net.Conn
 	Reader io.Reader
 	Writer io.Writer
 }
 
 // CloseWrite: *net.TCPConn and *tls.Conn
-func (c *Conn) CloseWrite() error {
+func (c *rawConn) CloseWrite() error {
 	if conn, ok := c.rw.(*net.TCPConn); ok {
 		return conn.CloseWrite()
 	}
@@ -242,7 +263,7 @@ func (c *Conn) CloseWrite() error {
 }
 
 // Read is ...
-func (c *Conn) Read(b []byte) (int, error) {
+func (c *rawConn) Read(b []byte) (int, error) {
 	if c.Reader == nil {
 		return c.rw.Read(b)
 	}
@@ -254,8 +275,8 @@ func (c *Conn) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// Write ...
-func (c *Conn) Write(b []byte) (int, error) {
+// Write is ...
+func (c *rawConn) Write(b []byte) (int, error) {
 	if c.Writer == nil {
 		if _, err := io.WriteString(c.rw, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 			return 0, err
@@ -266,12 +287,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 }
 
 // HandleTCP is ...
-func HandleTCP(rw io.ReadWriter, addr string) error {
-	raddr, err := net.ResolveTCPAddr("tcp", addr)
-	if err != nil {
-		return err
-	}
-
+func HandleTCP(rw io.ReadWriter, raddr *net.TCPAddr) error {
 	rc, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
 		return err
@@ -293,7 +309,7 @@ func HandleTCP(rw io.ReadWriter, addr string) error {
 
 	_, err = io.Copy(rw, io.Reader(rc))
 	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		if conn, ok := rw.(*Conn); ok {
+		if conn, ok := rw.(*rawConn); ok {
 			conn.CloseWrite()
 		}
 		rc.CloseRead()
@@ -307,12 +323,7 @@ func HandleTCP(rw io.ReadWriter, addr string) error {
 }
 
 // HandleUDP is ...
-func HandleUDP(rw io.ReadWriter, addr string, timeout time.Duration) error {
-	raddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return err
-	}
-
+func HandleUDP(rw io.ReadWriter, raddr *net.UDPAddr, timeout time.Duration) error {
 	rc, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
 		return err
@@ -346,9 +357,9 @@ func HandleUDP(rw io.ReadWriter, addr string, timeout time.Duration) error {
 		return
 	}(errCh)
 
+	n := 0
 	b := make([]byte, 16*1024)
 	for {
-		n := 0
 		rc.SetReadDeadline(time.Now().Add(timeout))
 		n, err = rc.Read(b[2:])
 		if err != nil {
