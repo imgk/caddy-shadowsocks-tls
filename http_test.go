@@ -21,4 +21,3 @@ func TestGenKey(t *testing.T) {
 	}
 	t.Errorf("auth length")
 }
-

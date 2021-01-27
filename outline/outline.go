@@ -1,12 +1,13 @@
 package outline
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
-	"strconv"
 )
 
 var unsafeClient = &http.Client{
@@ -30,13 +31,14 @@ type OutlineUser struct {
 	Port             int    `json:"port"`
 	Method           string `json:"method"`
 	AccessURL        string `json:"accessUrl"`
+	DataLimit        uint64 `json:"dataLimit,omitempty"`
 	TransferredBytes uint64 `json:"byteNum,omitempty"`
 }
 
 // Outline apiUrl
 // https://127.0.0.1:56298/QQR9pcgCRP_g5OLX3n-w-g
 type OutlineServer struct {
-	URL string `json:"_,omitempty"`
+	URL string `json:"url,omitempty"`
 
 	Name                 string `json:"name"`
 	ServerID             string `json:"serverId"`
@@ -59,7 +61,7 @@ func NewOutlineServer(url string) (*OutlineServer, error) {
 }
 
 func (s *OutlineServer) GetServerInfo() error {
-	req, err := http.NewRequest(http.MethodGet, s.URL+"/server", nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/server", s.URL), nil)
 	if err != nil {
 		return err
 	}
@@ -70,14 +72,14 @@ func (s *OutlineServer) GetServerInfo() error {
 		return err
 	}
 	if r.StatusCode != http.StatusOK {
-		return errors.New("status code error, code: " + strconv.Itoa(r.StatusCode))
+		return &CodeError{Code: r.StatusCode}
 	}
+	defer r.Body.Close()
 
 	b, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		return err
 	}
-	defer r.Body.Close()
 
 	if err := json.Unmarshal(b, s); err != nil {
 		return err
@@ -87,7 +89,7 @@ func (s *OutlineServer) GetServerInfo() error {
 }
 
 func (s *OutlineServer) GetUsage() (map[string]uint64, error) {
-	req, err := http.NewRequest(http.MethodGet, s.URL+"/metrics/transfer", nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/metrics/transfer", s.URL), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -98,14 +100,14 @@ func (s *OutlineServer) GetUsage() (map[string]uint64, error) {
 		return nil, err
 	}
 	if r.StatusCode != http.StatusOK {
-		return nil, errors.New("status code error, code: " + strconv.Itoa(r.StatusCode))
+		return nil, &CodeError{Code: r.StatusCode}
 	}
+	defer r.Body.Close()
 
 	b, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		return nil, err
 	}
-	defer r.Body.Close()
 
 	type BytesTransferred struct {
 		ByUserID map[string]uint64 `json:"bytesTransferredByUserId"`
@@ -127,7 +129,7 @@ func (s *OutlineServer) GetAllUser() error {
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodGet, s.URL+"/access-keys", nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/access-keys", s.URL), nil)
 	if err != nil {
 		return err
 	}
@@ -138,14 +140,14 @@ func (s *OutlineServer) GetAllUser() error {
 		return err
 	}
 	if r.StatusCode != http.StatusOK {
-		return errors.New("status code error, code: " + strconv.Itoa(r.StatusCode))
+		return &CodeError{Code: r.StatusCode}
 	}
+	defer r.Body.Close()
 
 	b, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		return err
 	}
-	defer r.Body.Close()
 
 	type Users struct {
 		AccessKeys []*OutlineUser `json:"accessKeys"`
@@ -161,4 +163,103 @@ func (s *OutlineServer) GetAllUser() error {
 	}
 
 	return nil
+}
+
+func (s *OutlineServer) AddUser() (*OutlineUser, error) {
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/access-keys", s.URL), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	r, err := unsafeClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if r.StatusCode != http.StatusCreated {
+		return nil, &CodeError{Code: r.StatusCode}
+	}
+	defer r.Body.Close()
+
+	b, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	user := &OutlineUser{}
+	if err := json.Unmarshal(b, user); err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+func (s *OutlineServer) DeleteUser(id string) error {
+	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/access-keys/%s", s.URL, id), nil)
+	if err != nil {
+		return err
+	}
+
+	r, err := unsafeClient.Do(req)
+	if err != nil {
+		return err
+	}
+	if r.StatusCode != http.StatusNoContent {
+		return &CodeError{Code: r.StatusCode}
+	}
+	defer r.Body.Close()
+
+	return nil
+}
+
+func (s *OutlineServer) SetDataLimit(id string, n uint64) error {
+	type Limit struct {
+		Bytes uint64 `json:"bytes"`
+	}
+	type Limitor struct {
+		Limit `json:"limit"`
+	}
+	limit := Limitor{Limit: Limit{Bytes: n}}
+	b, err := json.Marshal(limit)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/access-keys/%s/data-limit", s.URL, id), bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	r, err := unsafeClient.Do(req)
+	if err != nil {
+		return err
+	}
+	if r.StatusCode != http.StatusNoContent {
+		switch r.StatusCode {
+		case http.StatusBadRequest:
+			return errors.New("invalid data limit")
+		case http.StatusNotFound:
+			return errors.New("access key inexistent")
+		}
+		return &CodeError{Code: r.StatusCode}
+	}
+	defer r.Body.Close()
+	return nil
+}
+
+func (s *OutlineServer) AddUserWithDataLimit(n uint64) error {
+	user, err := s.AddUser()
+	if err != nil {
+		return err
+	}
+	return s.SetDataLimit(user.ID, n)
+}
+
+type CodeError struct {
+	Code int
+}
+
+func (err *CodeError) Error() string {
+	return fmt.Sprintf("status code (%v: %s) error", err.Code, http.StatusText(err.Code))
 }
